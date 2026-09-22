@@ -1,0 +1,8 @@
+venv/
+*.parquet
+*.pt
+*.ckpt
+*.json
+__pycache__/
+.vscode/
+.idea/
