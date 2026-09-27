@@ -18,15 +18,6 @@ Main training entrypoint for the spectrum -> SELFIES/SMILES transformer.
        and saves a checkpoint via src/utils.py whenever it's the best seen
        so far.
 
-Note on the validation metric: this loop tracks teacher-forced
-cross-entropy loss (cheap, one forward pass per val batch) as the
-"best model" criterion, not the competition's MRR — computing MRR requires
-autoregressive beam-search generation (BEAM_SIZE candidates per molecule),
-which is orders of magnitude slower per batch and belongs in evaluate.py as
-a separate, less-frequent check. Lower validation loss is a reasonable
-cheap proxy to select checkpoints during training; evaluate.py should be
-run against saved checkpoints to get the actual MRR before submitting.
-
 Usage:
     python train.py
 """
@@ -40,6 +31,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from src import config
 from src.dataset import MassSpecDataset, collate_fn
@@ -49,17 +41,16 @@ from src.utils import save_checkpoint
 
 SEED = 42
 N_SPLITS = 5  # 1/N_SPLITS of molecules held out for validation
-LOG_EVERY = 50  # print training loss every this many steps
 GRAD_CLIP_NORM = 1.0
-NUM_WORKERS = 0  # Set to 0 on Windows to avoid pickling 2.5M spectra across spawned processes
+NUM_WORKERS = getattr(config, "NUM_WORKERS", 0)  # Safe fallback to config setting
+CHECKPOINT_EVERY_STEPS = 2000  # Save intermediate safety checkpoints
 
 
 def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokenizer:
     """
     Load the SELFIES vocabulary if it's already been built (e.g. by a
     previous run), otherwise derive it from train.parquet's SMILES column
-    and persist it, so every subsequent run (and evaluate.py/submit.py)
-    sees the exact same token<->id mapping.
+    and persist it.
     """
     if os.path.exists(vocab_path):
         print(f"[tokenizer] loading existing vocab from {vocab_path}")
@@ -78,7 +69,7 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
         try:
             selfies_strings.append(sf.encoder(smiles))
         except Exception:
-            continue  # dropped rows are re-filtered identically inside MassSpecDataset
+            continue
 
     tokenizer = SelfiesTokenizer.build_vocab(selfies_strings)
     os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
@@ -88,27 +79,15 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
 
 
 def split_train_val(dataset: MassSpecDataset, n_splits: int = N_SPLITS, seed: int = SEED):
-    """
-    Group-aware split: every spectrum belonging to the same molecule_id
-    stays entirely in train or entirely in val, so validation loss isn't
-    inflated by the model having seen a near-duplicate spectrum (same
-    molecule, different adduct/collision energy) during training.
-    """
+    """Group-aware train/val split ensuring no molecule leakage across splits."""
     gkf = GroupKFold(n_splits=n_splits)
-    # GroupKFold doesn't take a random seed directly; molecule_id order is
-    # already arbitrary (parquet row order), so the first fold is used as-is.
-    # X is only used by sklearn to infer n_samples, so pass a cheap dummy
-    # index array rather than dataset.mz_arrays -- that's a list of
-    # variable-length (ragged) peak arrays, and sklearn's internal
-    # np.asarray(X) either raises or silently produces a broken object
-    # array when the per-row lengths differ.
     dummy_X = range(len(dataset))
     train_idx, val_idx = next(gkf.split(dummy_X, groups=dataset.molecule_ids))
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
-    """Move only tensor fields; molecule_id/spectrum_id stay as python lists."""
+    """Move tensor fields to target device."""
     return {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()
     }
@@ -117,11 +96,7 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
 def compute_loss(
     logits: torch.Tensor, batch: dict, loss_fn: nn.Module
 ) -> torch.Tensor:
-    """
-    logits: (B, MAX_SELFIES_LEN - 1, vocab_size), from
-    SpectrumToStructureTransformer.forward(), already aligned with
-    selfies_ids[:, 1:] (see that module's docstring for the shift).
-    """
+    """Compute cross-entropy loss against right-shifted SELFIES target ids."""
     target = batch["selfies_ids"][:, 1:]
     return loss_fn(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
 
@@ -135,20 +110,20 @@ def run_epoch(
     epoch: int = 0,
 ) -> float:
     """
-    One pass over `loader`. If `optimizer` is given, runs in training mode
-    (backward + step + grad clipping); otherwise runs in eval mode under
-    no_grad for validation. Returns the mean per-batch loss.
+    One pass over `loader` with a live tqdm progress bar.
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
     num_batches = 0
-    start_time = time.time()
+
+    desc = f"Epoch {epoch} [Train]" if is_train else f"Epoch {epoch} [Val]"
+    pbar = tqdm(loader, desc=desc, leave=True, dynamic_ncols=True)
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for step, batch in enumerate(loader):
+        for step, batch in enumerate(pbar, start=1):
             batch = move_batch_to_device(batch, device)
 
             if is_train:
@@ -164,13 +139,15 @@ def run_epoch(
 
             total_loss += loss.item()
             num_batches += 1
+            running_loss = total_loss / num_batches
 
-            if is_train and (step + 1) % LOG_EVERY == 0:
-                elapsed = time.time() - start_time
-                print(
-                    f"  epoch {epoch} step {step + 1}/{len(loader)} "
-                    f"loss {total_loss / num_batches:.4f} ({elapsed:.1f}s elapsed)"
-                )
+            # Live update progress bar metrics
+            pbar.set_postfix({"loss": f"{running_loss:.4f}"})
+
+            # Intermediate safety checkpointing during long training steps
+            if is_train and step % CHECKPOINT_EVERY_STEPS == 0:
+                chkpt_path = f"/kaggle/working/checkpoint_epoch{epoch}_step{step}.pt"
+                torch.save(model.state_dict(), chkpt_path)
 
     return total_loss / max(num_batches, 1)
 
@@ -197,11 +174,6 @@ def main():
         f"{len(train_dataset)} train / {len(val_dataset)} val"
     )
 
-    # pin_memory only helps when batches are subsequently moved to a CUDA
-    # device (it lets that H2D copy happen asynchronously); it's a no-op
-    # cost on CPU-only runs, so gate it on availability rather than always
-    # enabling it. persistent_workers avoids respawning the worker pool
-    # every epoch, which matters once num_workers > 0.
     loader_kwargs = dict(
         num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
@@ -231,9 +203,11 @@ def main():
         f"trainable parameters"
     )
 
+    epochs = getattr(config, "EPOCHS", getattr(config, "NUM_EPOCHS", 20))
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.NUM_EPOCHS
+        optimizer, T_max=epochs
     )
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=tokenizer.pad_id, label_smoothing=config.LABEL_SMOOTHING
@@ -241,16 +215,16 @@ def main():
 
     best_val_loss = float("inf")
 
-    for epoch in range(1, config.NUM_EPOCHS + 1):
-        print(f"\n[epoch {epoch}/{config.NUM_EPOCHS}] lr = {scheduler.get_last_lr()[0]:.2e}")
+    for epoch in range(1, epochs + 1):
+        print(f"\n--- Epoch {epoch}/{epochs} (lr = {scheduler.get_last_lr()[0]:.2e}) ---")
 
         train_loss = run_epoch(
             model, train_loader, loss_fn, device, optimizer=optimizer, epoch=epoch
         )
-        val_loss = run_epoch(model, val_loader, loss_fn, device, optimizer=None)
+        val_loss = run_epoch(model, val_loader, loss_fn, device, optimizer=None, epoch=epoch)
         scheduler.step()
 
-        print(f"[epoch {epoch}] train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
+        print(f"Summary: train_loss = {train_loss:.4f} | val_loss = {val_loss:.4f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -265,7 +239,7 @@ def main():
                 scheduler_state_dict=scheduler.state_dict(),
             )
             print(
-                f"[checkpoint] new best val_loss={best_val_loss:.4f}, "
+                f"[checkpoint] new best val_loss = {best_val_loss:.4f}, "
                 f"saved to {config.BEST_MODEL_PATH}"
             )
 

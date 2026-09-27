@@ -24,9 +24,9 @@ DIM_FEEDFORWARD = 2048
 DROPOUT = 0.1
 
 # Training Parameters
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LEARNING_RATE = 3e-4
-NUM_EPOCHS = 20
+NUM_EPOCHS = 3
 LABEL_SMOOTHING = 0.1
 
 # Inference / Evaluation Settings
