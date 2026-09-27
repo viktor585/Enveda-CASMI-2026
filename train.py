@@ -65,7 +65,7 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
         )
 
     selfies_strings = []
-    for smiles in df[smiles_col].tolist():
+    for smiles in tqdm(df[smiles_col].tolist(), desc="encoding SELFIES"):
         try:
             selfies_strings.append(sf.encoder(smiles))
         except Exception:

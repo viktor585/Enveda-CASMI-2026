@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 try:
     import selfies as sf
@@ -173,7 +174,7 @@ class SelfiesTokenizer:
                 raising, since real datasets routinely contain a few bad rows.
         """
         clean_strings: List[str] = []
-        for s in selfies_strings:
+        for s in tqdm(selfies_strings, desc="validating SELFIES"):
             if not s or not isinstance(s, str):
                 continue
             try:
