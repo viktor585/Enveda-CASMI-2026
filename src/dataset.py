@@ -27,12 +27,14 @@ pooled.
 Requires: torch, pandas, pyarrow, selfies, numpy
 """
 
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 
 try:
     import selfies as sf
@@ -240,7 +242,10 @@ class MassSpecDataset(Dataset):
         self.min_relative_intensity = min_relative_intensity
         self.is_train = is_train
 
+        print(f"[MassSpecDataset] reading {parquet_path} ...")
+        t0 = time.time()
         df = pd.read_parquet(parquet_path)
+        print(f"[MassSpecDataset] read {len(df):,} rows in {time.time() - t0:.1f}s")
 
         required_cols = {
             id_col,
@@ -296,7 +301,7 @@ class MassSpecDataset(Dataset):
             selfies_list: List[str] = []
             dropped = 0
             keep_mask = []
-            for smiles in smiles_list:
+            for smiles in tqdm(smiles_list, desc="[MassSpecDataset] encoding SELFIES"):
                 try:
                     selfies_list.append(sf.encoder(smiles))
                     keep_mask.append(True)
