@@ -22,10 +22,12 @@ Usage:
     python train.py
 """
 
+import gc
 import os
 import time
 
 import pandas as pd
+import pyarrow.parquet as pq
 import selfies as sf
 import torch
 import torch.nn as nn
@@ -57,19 +59,34 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
         return SelfiesTokenizer.load(vocab_path)
 
     print(f"[tokenizer] no vocab found at {vocab_path}, building from {parquet_path}")
-    df = pd.read_parquet(parquet_path)
-    smiles_col = "normalized_smiles" if "normalized_smiles" in df.columns else "smiles"
-    if smiles_col not in df.columns:
+
+    # Only read the schema first (cheap) to pick the right column name,
+    # then load JUST that column. Reading the full parquet here would also
+    # pull in ms2_mzs / ms2_normalized_intensities -- per-spectrum arrays
+    # up to MAX_PEAKS long -- which we don't need for vocab building and
+    # which can blow up memory badly at millions of rows (pandas stores
+    # array-valued columns as Python list objects per cell, with overhead
+    # far beyond the raw float size).
+    available_cols = pq.ParquetFile(parquet_path).schema.names
+    smiles_col = "normalized_smiles" if "normalized_smiles" in available_cols else "smiles"
+    if smiles_col not in available_cols:
         raise KeyError(
             f"{parquet_path} has neither 'normalized_smiles' nor 'smiles' column"
         )
 
+    df = pd.read_parquet(parquet_path, columns=[smiles_col])
+    smiles_list = df[smiles_col].tolist()
+    del df
+    gc.collect()
+
     selfies_strings = []
-    for smiles in tqdm(df[smiles_col].tolist(), desc="encoding SELFIES"):
+    for smiles in tqdm(smiles_list, desc="encoding SELFIES"):
         try:
             selfies_strings.append(sf.encoder(smiles))
         except Exception:
             continue
+    del smiles_list
+    gc.collect()
 
     tokenizer = SelfiesTokenizer.build_vocab(selfies_strings)
     os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
