@@ -301,7 +301,7 @@ class MassSpecDataset(Dataset):
             selfies_list: List[str] = []
             dropped = 0
             keep_mask = []
-            for smiles in tqdm(smiles_list, desc="[MassSpecDataset] encoding SELFIES"):
+            for smiles in tqdm(smiles_list, desc="[MassSpecDataset] encoding SELFIES", mininterval=1.0):
                 try:
                     selfies_list.append(sf.encoder(smiles))
                     keep_mask.append(True)

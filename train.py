@@ -80,7 +80,7 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
     gc.collect()
 
     selfies_strings = []
-    for smiles in tqdm(smiles_list, desc="encoding SELFIES"):
+    for smiles in tqdm(smiles_list, desc="encoding SELFIES", mininterval=1.0):
         try:
             selfies_strings.append(sf.encoder(smiles))
         except Exception:
@@ -136,7 +136,7 @@ def run_epoch(
     num_batches = 0
 
     desc = f"Epoch {epoch} [Train]" if is_train else f"Epoch {epoch} [Val]"
-    pbar = tqdm(loader, desc=desc, leave=True, dynamic_ncols=True)
+    pbar = tqdm(loader, desc=desc, leave=True, dynamic_ncols=True, mininterval=1.0)
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:

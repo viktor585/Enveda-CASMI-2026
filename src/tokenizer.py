@@ -174,7 +174,7 @@ class SelfiesTokenizer:
                 raising, since real datasets routinely contain a few bad rows.
         """
         clean_strings: List[str] = []
-        for s in tqdm(selfies_strings, desc="validating SELFIES"):
+        for s in tqdm(selfies_strings, desc="validating SELFIES", mininterval=1.0):
             if not s or not isinstance(s, str):
                 continue
             try:
