@@ -27,6 +27,7 @@ pooled.
 Requires: torch, pandas, pyarrow, selfies, numpy
 """
 
+import gc
 import time
 from typing import Dict, List, Optional
 
@@ -298,6 +299,16 @@ class MassSpecDataset(Dataset):
         self.selfies_list: Optional[List[str]] = None
         if is_train:
             smiles_list = df[smiles_col].tolist()
+
+            # Everything needed out of df has now been pulled into self.* /
+            # smiles_list above. df itself still holds the full mz/intensity
+            # array columns for all rows -- keeping it alive through the
+            # encoding loop below means those large arrays, the already-
+            # extracted self.* copies, AND the growing selfies_list are all
+            # resident in memory at once. Free it now.
+            del df
+            gc.collect()
+
             selfies_list: List[str] = []
             dropped = 0
             keep_mask = []
