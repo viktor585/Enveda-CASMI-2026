@@ -23,6 +23,7 @@ Usage:
 """
 
 import gc
+import math
 import os
 import time
 
@@ -45,8 +46,56 @@ from src.utils import save_checkpoint
 SEED = 42
 N_SPLITS = 5  # 1/N_SPLITS of molecules held out for validation
 GRAD_CLIP_NORM = 1.0
-NUM_WORKERS = getattr(config, "NUM_WORKERS", 0)  # Safe fallback to config setting
-CHECKPOINT_EVERY_STEPS = 2000  # Save intermediate safety checkpoints
+CHECKPOINT_EVERY_STEPS = 2000  # Save intermediate safety checkpoints (one rolling file)
+
+
+def _setting(name: str, default, cast):
+    """
+    Resolve a tunable as: environment variable > config.py attribute > default.
+    The env-var route lets you flip a knob from a notebook cell (`%env USE_AMP=0`)
+    without editing any file.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = getattr(config, name, default)
+    if cast is bool:
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return cast(raw)
+
+
+NUM_WORKERS = _setting("NUM_WORKERS", 2, int)  # CPU-side batch prep overlapped with the GPU
+USE_AMP = _setting("USE_AMP", True, bool)  # fp16 mixed precision (big win on T4 tensor cores)
+USE_DATAPARALLEL = _setting("USE_DATAPARALLEL", False, bool)  # split each batch across all GPUs
+VAL_MAX_SAMPLES = _setting("VAL_MAX_SAMPLES", 50_000, int)  # 0 = use the full validation split
+MAX_STEPS_PER_EPOCH = _setting("MAX_STEPS_PER_EPOCH", 0, int)  # 0 = full epoch
+
+
+class _AutocastForward(nn.Module):
+    """
+    Runs the wrapped model's forward under fp16 autocast.
+
+    Autocast is entered *inside* forward (rather than around the call site) so
+    that it also takes effect in nn.DataParallel's per-GPU replica threads --
+    autocast state is thread-local and would otherwise be silently skipped
+    there. The wrapped model is kept as `.model` so its parameters/state_dict
+    can still be saved and loaded unwrapped.
+    """
+
+    def __init__(self, model: nn.Module, enabled: bool):
+        super().__init__()
+        self.model = model
+        self.enabled = enabled
+
+    def forward(self, batch):
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.enabled):
+            return self.model(batch)
+
+
+def _make_grad_scaler(enabled: bool):
+    try:  # torch >= 2.3
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokenizer:
@@ -120,6 +169,7 @@ def compute_loss(
 ) -> torch.Tensor:
     """Compute cross-entropy loss against right-shifted SELFIES target ids."""
     target = batch["selfies_ids"][:, 1:]
+    logits = logits.float()  # logits may be fp16 under autocast; keep the loss in fp32
     return loss_fn(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
 
 
@@ -130,47 +180,80 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer = None,
     epoch: int = 0,
+    scaler=None,
+    max_steps: int = 0,
+    ckpt_model: nn.Module = None,
 ) -> float:
     """
     One pass over `loader` with a live tqdm progress bar.
+
+    `model` is whatever should be called for the forward pass (possibly wrapped
+    for autocast / DataParallel); `ckpt_model` is the plain, unwrapped model
+    whose state_dict gets written to the rolling safety checkpoint.
+    Batches whose loss is not finite are skipped (no backward/step) and excluded
+    from the reported average rather than poisoning it.
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
+    ckpt_model = ckpt_model if ckpt_model is not None else model
 
     total_loss = 0.0
     num_batches = 0
+    skipped = 0
 
     desc = f"Epoch {epoch} [Train]" if is_train else f"Epoch {epoch} [Val]"
-    pbar = tqdm(loader, desc=desc, leave=True, dynamic_ncols=True, mininterval=1.0)
+    total_steps = min(len(loader), max_steps) if max_steps else len(loader)
+    pbar = tqdm(
+        loader, desc=desc, total=total_steps, leave=True, dynamic_ncols=True, mininterval=1.0
+    )
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for step, batch in enumerate(pbar, start=1):
+            if max_steps and step > max_steps:
+                break
+
             batch = move_batch_to_device(batch, device)
 
             if is_train:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             logits = model(batch)
             loss = compute_loss(logits, batch, loss_fn)
 
-            if is_train:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-                optimizer.step()
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                skipped += 1
+                continue
 
-            total_loss += loss.item()
+            if is_train:
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)  # so clipping sees true gradient magnitudes
+                    torch.nn.utils.clip_grad_norm_(ckpt_model.parameters(), GRAD_CLIP_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(ckpt_model.parameters(), GRAD_CLIP_NORM)
+                    optimizer.step()
+
+            total_loss += loss_value
             num_batches += 1
             running_loss = total_loss / num_batches
 
             # Live update progress bar metrics
             pbar.set_postfix({"loss": f"{running_loss:.4f}"})
 
-            # Intermediate safety checkpointing during long training steps
+            # Rolling safety checkpoint (one file, overwritten) so a killed session
+            # doesn't lose everything, without filling the disk with copies.
             if is_train and step % CHECKPOINT_EVERY_STEPS == 0:
-                chkpt_path = f"/kaggle/working/checkpoint_epoch{epoch}_step{step}.pt"
-                torch.save(model.state_dict(), chkpt_path)
+                os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
+                chkpt_path = os.path.join(config.CHECKPOINT_DIR, "last_state_dict.pt")
+                torch.save(ckpt_model.state_dict(), chkpt_path)
 
+    if skipped:
+        print(f"[warn] skipped {skipped} batch(es) with non-finite loss in {desc}")
     return total_loss / max(num_batches, 1)
 
 
@@ -195,6 +278,14 @@ def main():
         f"[data] {len(full_dataset)} spectra total -> "
         f"{len(train_dataset)} train / {len(val_dataset)} val"
     )
+    if VAL_MAX_SAMPLES and len(val_dataset) > VAL_MAX_SAMPLES:
+        # A fixed random subset of the (already molecule-disjoint) validation
+        # split. Plenty for tracking val loss / picking the best checkpoint,
+        # at a small fraction of the cost of scoring every held-out spectrum.
+        gen = torch.Generator().manual_seed(SEED)
+        keep = torch.randperm(len(val_dataset), generator=gen)[:VAL_MAX_SAMPLES].tolist()
+        val_dataset = Subset(val_dataset, keep)
+        print(f"[data] validating on a fixed {len(val_dataset)}-spectrum subset")
 
     loader_kwargs = dict(
         num_workers=NUM_WORKERS,
@@ -225,7 +316,25 @@ def main():
         f"trainable parameters"
     )
 
-    epochs = getattr(config, "EPOCHS", getattr(config, "NUM_EPOCHS", 20))
+    use_amp = USE_AMP and device.type == "cuda"
+    # `model` stays the plain module (used for the optimizer and checkpoints);
+    # `fwd_model` is what actually gets called for forward passes.
+    fwd_model = _AutocastForward(model, enabled=use_amp)
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if USE_DATAPARALLEL and n_gpus > 1:
+        fwd_model = nn.DataParallel(fwd_model)
+        print(f"[setup] DataParallel across {n_gpus} GPUs")
+    elif USE_DATAPARALLEL:
+        print("[setup] USE_DATAPARALLEL requested but only one device found; ignoring")
+    scaler = _make_grad_scaler(enabled=use_amp)
+    print(
+        f"[setup] mixed precision (fp16) = {use_amp} | workers = {NUM_WORKERS} | "
+        f"max steps/epoch = {MAX_STEPS_PER_EPOCH or 'full'}"
+    )
+
+    epochs = int(
+        os.environ.get("NUM_EPOCHS", getattr(config, "EPOCHS", getattr(config, "NUM_EPOCHS", 20)))
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -241,9 +350,25 @@ def main():
         print(f"\n--- Epoch {epoch}/{epochs} (lr = {scheduler.get_last_lr()[0]:.2e}) ---")
 
         train_loss = run_epoch(
-            model, train_loader, loss_fn, device, optimizer=optimizer, epoch=epoch
+            fwd_model,
+            train_loader,
+            loss_fn,
+            device,
+            optimizer=optimizer,
+            epoch=epoch,
+            scaler=scaler,
+            max_steps=MAX_STEPS_PER_EPOCH,
+            ckpt_model=model,
         )
-        val_loss = run_epoch(model, val_loader, loss_fn, device, optimizer=None, epoch=epoch)
+        val_loss = run_epoch(
+            fwd_model,
+            val_loader,
+            loss_fn,
+            device,
+            optimizer=None,
+            epoch=epoch,
+            ckpt_model=model,
+        )
         scheduler.step()
 
         print(f"Summary: train_loss = {train_loss:.4f} | val_loss = {val_loss:.4f}")
