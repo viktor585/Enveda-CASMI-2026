@@ -27,6 +27,7 @@ import os
 import time
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import selfies as sf
 import torch
@@ -75,9 +76,13 @@ def get_or_build_tokenizer(parquet_path: str, vocab_path: str) -> SelfiesTokeniz
         )
 
     df = pd.read_parquet(parquet_path, columns=[smiles_col])
-    smiles_list = df[smiles_col].tolist()
+    # Spectra vastly outnumber molecules and share SMILES, so encode each
+    # distinct SMILES once -- the alphabet (a set) comes out identical.
+    smiles_list = list(dict.fromkeys(df[smiles_col].tolist()))
     del df
     gc.collect()
+    pa.default_memory_pool().release_unused()
+    print(f"[tokenizer] encoding {len(smiles_list):,} unique SMILES")
 
     selfies_strings = []
     for smiles in tqdm(smiles_list, desc="encoding SELFIES", mininterval=1.0):

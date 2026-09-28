@@ -33,6 +33,9 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
@@ -193,6 +196,80 @@ def get_molecule_id_groups(df: pd.DataFrame, id_col: str = "molecule_id") -> Dic
 
 
 # ---------------------------------------------------------------------------
+# Compact storage for ragged peak arrays
+# ---------------------------------------------------------------------------
+def _release_arrow_memory() -> None:
+    """
+    pyarrow's allocator (mimalloc) caches freed buffers instead of returning
+    them to the OS, so process RSS -- which is what a container memory limit
+    counts -- stays inflated long after the Arrow data is gone. Ask for it back.
+    """
+    pa.default_memory_pool().release_unused()
+
+
+class _FlatRagged:
+    """
+    Ragged array of float32 sequences stored as one flat values buffer plus an
+    offsets vector, instead of millions of separate numpy objects. Supports
+    `len(x)` and `x[i]` (returns a float32 slice), so it can stand in for the
+    old list-of-arrays. `rows` is an optional index map used to represent a
+    filtered subset without copying the underlying buffer.
+    """
+
+    def __init__(self, values: np.ndarray, offsets: np.ndarray, rows: Optional[np.ndarray] = None):
+        self.values = values
+        self.offsets = offsets
+        self.rows = rows
+
+    def __len__(self) -> int:
+        return len(self.offsets) - 1 if self.rows is None else len(self.rows)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        r = int(i) if self.rows is None else int(self.rows[i])
+        return self.values[self.offsets[r] : self.offsets[r + 1]]
+
+    def subset(self, keep_idx) -> "_FlatRagged":
+        keep = np.asarray(keep_idx, dtype=np.int64)
+        rows = keep if self.rows is None else self.rows[keep]
+        return _FlatRagged(self.values, self.offsets, rows)
+
+
+def _read_ragged_float32(path: str, col: str, batch_rows: int = 25_000) -> _FlatRagged:
+    """
+    Stream a list-typed parquet column into a compact float32 `_FlatRagged`,
+    one record batch at a time, so peak memory stays near the final float32
+    size rather than the (much larger) pandas object representation.
+    """
+    pf = pq.ParquetFile(path)
+    value_chunks: List[np.ndarray] = []
+    length_chunks: List[np.ndarray] = []
+    for batch in pf.iter_batches(batch_size=batch_rows, columns=[col]):
+        arr = batch.column(0)
+        if isinstance(arr, pa.ChunkedArray):
+            arr = arr.combine_chunks()
+        if not (pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type)
+                or pa.types.is_fixed_size_list(arr.type)):
+            raise TypeError(
+                f"column {col!r} has arrow type {arr.type}; expected a list type"
+            )
+        lengths = pc.list_value_length(arr).fill_null(0).to_numpy(zero_copy_only=False)
+        vals = arr.flatten().to_numpy(zero_copy_only=False)
+        length_chunks.append(lengths.astype(np.int64, copy=False))
+        # float64 -> float32 astype copies, so the Arrow buffers behind `vals`
+        # are not kept alive by the stored chunk.
+        value_chunks.append(vals.astype(np.float32))
+        del batch, arr, vals, lengths
+        _release_arrow_memory()
+    lengths_all = np.concatenate(length_chunks) if length_chunks else np.zeros(0, np.int64)
+    values_all = np.concatenate(value_chunks) if value_chunks else np.zeros(0, np.float32)
+    del length_chunks, value_chunks, pf
+    offsets = np.zeros(len(lengths_all) + 1, dtype=np.int64)
+    np.cumsum(lengths_all, out=offsets[1:])
+    _release_arrow_memory()
+    return _FlatRagged(values_all, offsets)
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 class MassSpecDataset(Dataset):
@@ -245,8 +322,7 @@ class MassSpecDataset(Dataset):
 
         print(f"[MassSpecDataset] reading {parquet_path} ...")
         t0 = time.time()
-        df = pd.read_parquet(parquet_path)
-        print(f"[MassSpecDataset] read {len(df):,} rows in {time.time() - t0:.1f}s")
+        schema_names = pq.ParquetFile(parquet_path).schema_arrow.names
 
         required_cols = {
             id_col,
@@ -256,7 +332,7 @@ class MassSpecDataset(Dataset):
             adduct_col,
             collision_energy_col,
         }
-        missing = required_cols - set(df.columns)
+        missing = required_cols - set(schema_names)
         if missing:
             raise KeyError(
                 f"parquet at {parquet_path} is missing expected column(s) {missing}; "
@@ -266,7 +342,7 @@ class MassSpecDataset(Dataset):
         if is_train:
             if smiles_col is None:
                 for candidate in ("normalized_smiles", "smiles"):
-                    if candidate in df.columns:
+                    if candidate in schema_names:
                         smiles_col = candidate
                         break
                 if smiles_col is None:
@@ -274,18 +350,38 @@ class MassSpecDataset(Dataset):
                         "is_train=True but neither 'normalized_smiles' nor 'smiles' "
                         "was found; pass smiles_col explicitly"
                     )
-            elif smiles_col not in df.columns:
+            elif smiles_col not in schema_names:
                 raise KeyError(f"smiles_col={smiles_col!r} not found in parquet")
+
+        # Small scalar columns go through pandas; the big ragged peak columns
+        # are streamed straight into compact float32 buffers (see
+        # _read_ragged_float32) and never materialized as pandas objects.
+        has_spectrum_id = spectrum_id_col in schema_names
+        small_cols = [id_col, precursor_mz_col, adduct_col, collision_energy_col]
+        if has_spectrum_id:
+            small_cols.append(spectrum_id_col)
+        if is_train:
+            small_cols.append(smiles_col)
+        small_cols = list(dict.fromkeys(small_cols))
+        df = pd.read_parquet(parquet_path, columns=small_cols)
+
+        self.mz_arrays = _read_ragged_float32(parquet_path, mz_col)
+        self.intensity_arrays = _read_ragged_float32(parquet_path, intensity_col)
+        if not (len(df) == len(self.mz_arrays) == len(self.intensity_arrays)):
+            raise ValueError(
+                f"row count mismatch: scalars={len(df)}, mz={len(self.mz_arrays)}, "
+                f"intensity={len(self.intensity_arrays)}"
+            )
+        print(f"[MassSpecDataset] read {len(df):,} rows in {time.time() - t0:.1f}s")
 
         # Each row is already one full spectrum -- no groupby here.
         self.spectrum_ids = (
-            df[spectrum_id_col].tolist() if spectrum_id_col in df.columns else df.index.tolist()
+            df[spectrum_id_col].tolist() if has_spectrum_id else df.index.tolist()
         )
         self.molecule_ids = df[id_col].tolist()
-        self.mz_arrays = df[mz_col].tolist()
-        self.intensity_arrays = df[intensity_col].tolist()
         self.precursor_mz = df[precursor_mz_col].astype(float).tolist()
         self.adduct_ids = [adduct_to_id(a) for a in df[adduct_col].tolist()]
+
         def _parse_float_scalar(val):
             if hasattr(val, "__iter__") and not isinstance(val, (str, bytes)):
                 return float(val[0]) if len(val) > 0 else 0.0
@@ -295,46 +391,48 @@ class MassSpecDataset(Dataset):
                 return 0.0
 
         self.collision_energy = [_parse_float_scalar(x) for x in df[collision_energy_col]]
+        smiles_list = df[smiles_col].tolist() if is_train else None
+        del df
+        gc.collect()
+        _release_arrow_memory()
 
         self.selfies_list: Optional[List[str]] = None
         if is_train:
-            smiles_list = df[smiles_col].tolist()
-
-            # Everything needed out of df has now been pulled into self.* /
-            # smiles_list above. df itself still holds the full mz/intensity
-            # array columns for all rows -- keeping it alive through the
-            # encoding loop below means those large arrays, the already-
-            # extracted self.* copies, AND the growing selfies_list are all
-            # resident in memory at once. Free it now.
-            del df
-            gc.collect()
-
-            selfies_list: List[str] = []
-            dropped = 0
-            keep_mask = []
-            for smiles in tqdm(smiles_list, desc="[MassSpecDataset] encoding SELFIES", mininterval=1.0):
+            # Many spectra share one molecule, hence one SMILES. Encode each
+            # distinct SMILES once and reuse the result (the resulting strings
+            # are shared by reference, so this also saves memory).
+            unique_smiles = list(dict.fromkeys(smiles_list))
+            print(
+                f"[MassSpecDataset] {len(unique_smiles):,} unique SMILES "
+                f"across {len(smiles_list):,} spectra"
+            )
+            encoded: Dict = {}
+            for smiles in tqdm(
+                unique_smiles, desc="[MassSpecDataset] encoding SELFIES", mininterval=1.0
+            ):
                 try:
-                    selfies_list.append(sf.encoder(smiles))
-                    keep_mask.append(True)
+                    encoded[smiles] = sf.encoder(smiles)
                 except Exception:
-                    dropped += 1
-                    keep_mask.append(False)
+                    encoded[smiles] = None
 
+            selfies_all = [encoded.get(s) for s in smiles_list]
+            keep_idx = [i for i, s in enumerate(selfies_all) if s is not None]
+            dropped = len(selfies_all) - len(keep_idx)
             if dropped:
                 print(
                     f"[MassSpecDataset] dropped {dropped}/{len(smiles_list)} rows "
                     f"whose SMILES could not be encoded to SELFIES"
                 )
-                keep_idx = [i for i, k in enumerate(keep_mask) if k]
                 self.spectrum_ids = [self.spectrum_ids[i] for i in keep_idx]
                 self.molecule_ids = [self.molecule_ids[i] for i in keep_idx]
-                self.mz_arrays = [self.mz_arrays[i] for i in keep_idx]
-                self.intensity_arrays = [self.intensity_arrays[i] for i in keep_idx]
+                self.mz_arrays = self.mz_arrays.subset(keep_idx)
+                self.intensity_arrays = self.intensity_arrays.subset(keep_idx)
                 self.precursor_mz = [self.precursor_mz[i] for i in keep_idx]
                 self.adduct_ids = [self.adduct_ids[i] for i in keep_idx]
                 self.collision_energy = [self.collision_energy[i] for i in keep_idx]
+                selfies_all = [selfies_all[i] for i in keep_idx]
 
-            self.selfies_list = selfies_list
+            self.selfies_list = selfies_all
 
     def __len__(self) -> int:
         return len(self.spectrum_ids)
