@@ -81,6 +81,7 @@ class SelfiesDecoder(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,  # pre-norm: much more stable under fp16 than the post-norm default
         )
         self.decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_decoder_layers, norm=nn.LayerNorm(d_model)

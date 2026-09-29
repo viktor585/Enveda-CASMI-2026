@@ -68,6 +68,7 @@ USE_AMP = _setting("USE_AMP", True, bool)  # fp16 mixed precision (big win on T4
 USE_DATAPARALLEL = _setting("USE_DATAPARALLEL", False, bool)  # split each batch across all GPUs
 VAL_MAX_SAMPLES = _setting("VAL_MAX_SAMPLES", 50_000, int)  # 0 = use the full validation split
 MAX_STEPS_PER_EPOCH = _setting("MAX_STEPS_PER_EPOCH", 0, int)  # 0 = full epoch
+WARMUP_STEPS = _setting("WARMUP_STEPS", 1000, int)  # linear LR ramp before the cosine decay
 
 
 class _AutocastForward(nn.Module):
@@ -183,6 +184,7 @@ def run_epoch(
     scaler=None,
     max_steps: int = 0,
     ckpt_model: nn.Module = None,
+    step_scheduler=None,
 ) -> float:
     """
     One pass over `loader` with a live tqdm progress bar.
@@ -238,6 +240,9 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(ckpt_model.parameters(), GRAD_CLIP_NORM)
                     optimizer.step()
 
+                if step_scheduler is not None:
+                    step_scheduler.step()
+
             total_loss += loss_value
             num_batches += 1
             running_loss = total_loss / num_batches
@@ -254,7 +259,14 @@ def run_epoch(
 
     if skipped:
         print(f"[warn] skipped {skipped} batch(es) with non-finite loss in {desc}")
-    return total_loss / max(num_batches, 1)
+    if num_batches == 0:
+        # Every batch this epoch was non-finite. Returning 0.0 here (the old
+        # `total_loss / max(num_batches, 1)` behavior) would look like a
+        # perfect loss and trick main()'s `val_loss < best_val_loss` check
+        # into overwriting the best checkpoint with a fully-diverged model.
+        # inf is never "better", so a wrecked epoch can never win.
+        return float("inf")
+    return total_loss / num_batches
 
 
 def main():
@@ -337,9 +349,28 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs
+
+    # Linear warmup for WARMUP_STEPS steps, then cosine decay to ~0 over the
+    # remaining steps. Stepped once per optimizer update (inside run_epoch),
+    # not once per epoch -- post-norm Transformer layers are prone to fp16
+    # overflow if the LR jumps straight to its full value, so the ramp needs
+    # to happen gradually within epoch 1, not only change epoch-to-epoch.
+    steps_per_epoch = len(train_loader) if not MAX_STEPS_PER_EPOCH else min(
+        len(train_loader), MAX_STEPS_PER_EPOCH
     )
+    total_steps = max(steps_per_epoch * epochs, 1)
+    warmup_steps = min(WARMUP_STEPS, max(total_steps // 10, 1))
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        progress = min(progress, 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+    print(f"[setup] LR warmup = {warmup_steps} steps, then cosine decay over {total_steps} total steps")
+
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=tokenizer.pad_id, label_smoothing=config.LABEL_SMOOTHING
     )
@@ -347,7 +378,7 @@ def main():
     best_val_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
-        print(f"\n--- Epoch {epoch}/{epochs} (lr = {scheduler.get_last_lr()[0]:.2e}) ---")
+        print(f"\n--- Epoch {epoch}/{epochs} (lr = {optimizer.param_groups[0]['lr']:.2e}) ---")
 
         train_loss = run_epoch(
             fwd_model,
@@ -359,6 +390,7 @@ def main():
             scaler=scaler,
             max_steps=MAX_STEPS_PER_EPOCH,
             ckpt_model=model,
+            step_scheduler=scheduler,
         )
         val_loss = run_epoch(
             fwd_model,
@@ -369,7 +401,6 @@ def main():
             epoch=epoch,
             ckpt_model=model,
         )
-        scheduler.step()
 
         print(f"Summary: train_loss = {train_loss:.4f} | val_loss = {val_loss:.4f}")
 

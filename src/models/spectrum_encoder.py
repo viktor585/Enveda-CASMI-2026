@@ -157,6 +157,7 @@ class SpectrumEncoder(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,  # pre-norm: much more stable under fp16 than the post-norm default
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_encoder_layers, norm=nn.LayerNorm(d_model)
